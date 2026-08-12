@@ -1,1 +1,1 @@
-# Depósito de remédios com alarme inteligente
+# Depósito inteligente de remédios
