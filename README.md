@@ -1,1 +1,0 @@
-# smart-medcine-case
