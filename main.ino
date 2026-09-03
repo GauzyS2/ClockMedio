@@ -10,6 +10,11 @@ int d7 = 15;
 
 LiquidCrystal lcd(rs, e, d4, d5, d6, d7);
 
+//
+unsigned long tempo-inicial = 0; unsigned long tempo-atual = 0; //Guardam leituras do millis().
+
+
+
 void setup() 
 {
   lcd.begin(16, 2); //LCD de 16 colunas e 2 linhas.
@@ -24,7 +29,10 @@ void loop()
 
 }
 
-//Criação dos caracteres personalizados:
+//==================================================
+//            CARACTERES PERSONALIZADOS
+//==================================================
+
 byte seta-esquerda[8] = 
 {
   B00000,
@@ -48,3 +56,13 @@ byte seta-direita[8] =
   B00000,
   B00000
 };
+
+//==================================================
+//                      MENUS
+//==================================================
+
+//Menu padrão
+if()
+{
+  /* code */
+}
