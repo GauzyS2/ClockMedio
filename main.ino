@@ -1,6 +1,14 @@
 /*
- * ALARME DE REMEDIO - COM SELECAO DE DIAS E REPETICAO
- * ESP32-S3 + display 1.77" (ST7735) + 3 buzzers + fim de curso + Botao de Reset Wi-Fi
+ * ALARME DE REMEDIO - COMPLETO (versao corrigida)
+ * ESP32-S3 + display 1.77" (ST7735) + 3 buzzers + fim de curso
+ *
+ * Luz do display:
+ *  - fica acesa por 2 minutos depois de ligar o aparelho;
+ *  - acende por 30 segundos quando voce da um toque curto no botao BOOT;
+ *  - acende 3 minutos antes de um alarme e fica acesa ate 3 minutos depois dele;
+ *  - fica sempre acesa enquanto o alarme toca.
+ *
+ * Botao BOOT (GPIO 0): toque curto = acende a tela; segurar 3 segundos = apaga o Wi-Fi salvo.
  */
 
 #include <WiFi.h>
@@ -15,7 +23,10 @@
 
 // ================== 1. CONFIGURACOES ==================
 
-#define MAX_ALARMES 10   // quantos alarmes cabem
+#define MAX_ALARMES 10                    // quantos alarmes cabem
+#define LUZ_APOS_LIGAR_MS 120000UL        // luz acesa por 2 minutos depois de ligar
+#define LUZ_APOS_TOQUE_MS 30000UL         // luz acesa por 30 s depois de um toque no botao
+#define JANELA_LUZ_S 180                  // luz acesa 3 minutos antes e depois dos alarmes
 
 // ================== 2. PINOS ==================
 
@@ -33,8 +44,8 @@
 #define BUZZER3 40
 #define TAMPA   21
 
-// Botao para resetar o Wi-Fi
-#define BOTAO_WIFI 0
+// Botao BOOT da placa (GPIO 0)
+#define BOTAO 0
 
 // ================== 3. VARIAVEIS ==================
 
@@ -42,23 +53,26 @@ Adafruit_ST7735 tft = Adafruit_ST7735(&SPI, TFT_CS, TFT_RS, TFT_RST);
 WebServer server(80);
 Preferences memoria;
 
-// Cada alarme guarda estas informacoes
 struct Alarme {
   uint8_t usado;       // 1 = esta posicao da lista tem um alarme
   uint8_t hora;        // 0 a 23
   uint8_t minuto;      // 0 a 59
-  uint8_t repetir;     // 1 = repete, 0 = toca apenas uma vez
-  uint8_t diasSemana;  // Bitmask dos dias (Bit 0=Seg, Bit 1=Ter, ..., Bit 6=Dom)
+  uint8_t repetir;     // 0 = toca uma vez so; 1 = repete
+  uint8_t intervalo;   // 0 = usa os dias da semana; 1 a 24 = repete a cada tantas horas
+  uint8_t diasSemana;  // bits: Seg=1, Ter=2, Qua=4, Qui=8, Sex=16, Sab=32, Dom=64 (0 = todos)
   char nome[33];       // nome do remedio
-  uint32_t ancora;     // timestamp de referencia
+  uint32_t ancora;     // primeira vez que toca (segundos desde 1970)
 };
 
-Alarme alarmes[MAX_ALARMES];   
+Alarme alarmes[MAX_ALARMES];
 
-bool tocando = false;          
-uint32_t ultimaChecagem = 0;   
-int ultimoSegundo = -1;        
-bool tampaJaFechou = false;    
+bool tocando = false;               // true enquanto o alarme esta tocando
+uint32_t ultimaChecagem = 0;        // ultimo segundo em que conferimos os alarmes
+int ultimoSegundo = -1;             // para so redesenhar a hora quando o segundo muda
+bool tampaJaFechou = false;         // true quando a tampa foi vista fechada durante o alarme
+bool displayLigado = true;          // estado atual da luz do display
+unsigned long luzAcesaAte = 0;      // a luz fica acesa ate este instante (millis)
+uint32_t ultimoEventoAlarme = 0;    // ultima vez que um alarme comecou ou parou de tocar
 
 // ================== 4. FUNCOES: ALARMES NA MEMORIA ==================
 
@@ -73,6 +87,7 @@ void salvarAlarmes() {
   memoria.putBytes("lista", alarmes, sizeof(alarmes));
 }
 
+// Copia o nome deixando so caracteres simples (sem aspas, barras ou acentos)
 void copiarNome(char* destino, String origem) {
   origem.trim();
   int n = 0;
@@ -87,26 +102,35 @@ void copiarNome(char* destino, String origem) {
 
 // ================== 5. FUNCOES: HORA E CALCULO DOS ALARMES ==================
 
+// So vale depois que a internet acertou o relogio
 bool horaValida() {
   return time(nullptr) > 1700000000UL;
 }
 
-// Calcula o proximo disparo considerando os dias da semana selecionados
+// Proxima vez que o alarme toca, a partir de um instante.
+// Devolve 0xFFFFFFFF se o alarme nao vai tocar mais (alarme de uma vez so que ja passou).
 uint32_t proximoDisparo(const Alarme& a, uint32_t instante) {
+  // Alarme de uma vez so
+  if (!a.repetir) {
+    if (instante <= a.ancora) return a.ancora;
+    return 0xFFFFFFFFUL;
+  }
+
+  // Repete a cada X horas
+  if (a.intervalo > 0) {
+    uint32_t periodo = a.intervalo * 3600UL;
+    if (instante <= a.ancora) return a.ancora;
+    uint32_t k = (instante - a.ancora + periodo - 1) / periodo;
+    return a.ancora + k * periodo;
+  }
+
+  // Repete nos dias da semana escolhidos
   time_t t_instante = instante;
   struct tm tm_atual;
   localtime_r(&t_instante, &tm_atual);
 
-  // Se nao repete, a ancora e o momento exato em que foi agendado
-  if (!a.repetir) {
-    if (instante <= a.ancora) return a.ancora;
-    return 0xFFFFFFFFUL; // Ja passou e nao repete (invalido/expirado)
-  }
-
-  // Se repete todos os dias (nenhum dia especifico marcado, ou todos marcados)
   uint8_t dias = a.diasSemana == 0 ? 0x7F : a.diasSemana;
 
-  // Testa os proximos 8 dias para achar o primeiro dia valido
   for (int d = 0; d < 8; d++) {
     struct tm tm_teste = tm_atual;
     tm_teste.tm_mday += d;
@@ -114,13 +138,12 @@ uint32_t proximoDisparo(const Alarme& a, uint32_t instante) {
     tm_teste.tm_min = a.minuto;
     tm_teste.tm_sec = 0;
     tm_teste.tm_isdst = -1;
-    
+
     time_t tempoAlvo = mktime(&tm_teste);
     if (tempoAlvo < instante) continue;
 
-    // Converte tm_wday (0=Domingo, 1=Segunda...) para o nosso formato (0=Segunda ... 6=Domingo)
-    int wday = tm_teste.tm_wday; 
-    int nossoDia = (wday == 0) ? 6 : (wday - 1);
+    int wday = tm_teste.tm_wday;                 // 0 = domingo
+    int nossoDia = (wday == 0) ? 6 : (wday - 1); // 0 = segunda ... 6 = domingo
 
     if (dias & (1 << nossoDia)) {
       return (uint32_t)tempoAlvo;
@@ -129,6 +152,7 @@ uint32_t proximoDisparo(const Alarme& a, uint32_t instante) {
   return a.ancora;
 }
 
+// Escreve o disparo como "08:00" (se for hoje) ou "05/11 08:00" (outro dia)
 String textoProximo(uint32_t disparo) {
   if (disparo == 0xFFFFFFFFUL) return String("Expirado");
   time_t d = disparo;
@@ -147,6 +171,7 @@ String textoProximo(uint32_t disparo) {
 
 // ================== 6. FUNCOES: DISPLAY ==================
 
+// Tela normal: fundo preto, endereco do site embaixo e letra grande para a hora
 void telaRelogio() {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(1);
@@ -159,6 +184,7 @@ void telaRelogio() {
   ultimoSegundo = -1;
 }
 
+// Tela do alarme: fundo vermelho com o nome do remedio
 void telaAlarme(const char* nome) {
   tft.fillScreen(ST77XX_RED);
   tft.setTextSize(2);
@@ -174,6 +200,7 @@ void telaAlarme(const char* nome) {
   tft.print(nome);
 }
 
+// Dica no pe da tela do alarme: aparece se a tampa ja estava aberta quando o alarme tocou
 void dicaTampa(bool mostrar) {
   tft.fillRect(0, 105, tft.width(), 23, ST77XX_RED);
   if (mostrar) {
@@ -184,6 +211,7 @@ void dicaTampa(bool mostrar) {
   }
 }
 
+// Instrucoes mostradas quando o ESP32 abre o Wi-Fi de configuracao
 void telaConfigurarWifi(WiFiManager* wm) {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextSize(1);
@@ -209,7 +237,9 @@ void telaConfigurarWifi(WiFiManager* wm) {
   tft.print("192.168.4.1");
 }
 
+// Escreve a hora no display, no formato HH:MM:SS (so quando o segundo muda)
 void mostrarHora() {
+  if (!displayLigado) return;   // tela apagada: nao gasta tempo desenhando
   time_t agora = time(nullptr);
   struct tm t;
   localtime_r(&agora, &t);
@@ -222,8 +252,52 @@ void mostrarHora() {
   tft.print(texto);
 }
 
-// ================== 7. FUNCOES: BUZZER E TAMPA ==================
+// Decide se a luz do display fica acesa ou apagada
+void controlarLuzDisplay(uint32_t agora) {
+  // Alarme tocando: luz sempre acesa (a tela do alarme ja esta desenhada)
+  if (tocando) {
+    if (!displayLigado) {
+      digitalWrite(TFT_LED, HIGH);
+      displayLigado = true;
+    }
+    return;
+  }
 
+  bool deveLigar = false;
+
+  if ((long)(luzAcesaAte - millis()) > 0) {
+    // 2 minutos depois de ligar, ou 30 segundos depois de um toque no botao
+    deveLigar = true;
+  } else {
+    // Falta 3 minutos ou menos para algum alarme?
+    for (int i = 0; i < MAX_ALARMES; i++) {
+      if (!alarmes[i].usado) continue;
+      uint32_t disp = proximoDisparo(alarmes[i], agora);
+      if (disp != 0xFFFFFFFFUL && disp >= agora && disp - agora <= JANELA_LUZ_S) {
+        deveLigar = true;
+        break;
+      }
+    }
+    // Um alarme comecou ou parou de tocar ha menos de 3 minutos?
+    if (ultimoEventoAlarme != 0 && agora - ultimoEventoAlarme <= JANELA_LUZ_S) {
+      deveLigar = true;
+    }
+  }
+
+  if (deveLigar && !displayLigado) {
+    digitalWrite(TFT_LED, HIGH);
+    displayLigado = true;
+    telaRelogio();                 // redesenha a tela ao acender
+  } else if (!deveLigar && displayLigado) {
+    digitalWrite(TFT_LED, LOW);    // apaga a luz de fundo
+    displayLigado = false;
+  }
+}
+
+// ================== 7. FUNCOES: BUZZER, TAMPA E BOTAO ==================
+
+// Liga os 3 buzzers fazendo um som por 'tempo' milissegundos.
+// O pino liga e desliga bem rapido (cerca de 2700 vezes por segundo) para gerar o som.
 void bipe(int tempo) {
   unsigned long fim = millis() + tempo;
   while (millis() < fim) {
@@ -238,8 +312,36 @@ void bipe(int tempo) {
   }
 }
 
+// Tampa aberta = circuito aberto = pino le HIGH
 bool tampaAberta() {
   return digitalRead(TAMPA) == HIGH;
+}
+
+// Botao BOOT: toque curto acende a tela; segurar 3 segundos apaga o Wi-Fi salvo
+void verificarBotao() {
+  if (digitalRead(BOTAO) != LOW) return;
+
+  unsigned long inicio = millis();
+  while (digitalRead(BOTAO) == LOW) {
+    if (millis() - inicio > 3000) {
+      digitalWrite(TFT_LED, HIGH);
+      tft.fillScreen(ST77XX_BLACK);
+      tft.setCursor(5, 50);
+      tft.setTextSize(1);
+      tft.setTextColor(ST77XX_YELLOW);
+      tft.print("Resetando Wi-Fi...");
+
+      WiFiManager wm;
+      wm.resetSettings();
+      delay(1000);
+      ESP.restart();
+    }
+    delay(20);
+  }
+
+  if (millis() - inicio >= 50) {   // ignora ruido muito curto
+    luzAcesaAte = millis() + LUZ_APOS_TOQUE_MS;
+  }
 }
 
 // ================== 8. FUNCOES: SITE ==================
@@ -265,7 +367,7 @@ button.sec{background:#3a4452}
 button.perigo{background:#d64545}
 form{background:#1b222c;border-radius:12px;padding:14px;margin-top:16px}
 label{display:block;margin-bottom:12px;font-size:14px;color:#9fb0c3}
-input[type="text"], input[type="time"]{display:block;width:100%;box-sizing:border-box;margin-top:6px;padding:12px;font-size:18px;border-radius:8px;border:1px solid #3a4452;background:#10141a;color:#e8edf2}
+input[type="text"], input[type="time"], input[type="number"]{display:block;width:100%;box-sizing:border-box;margin-top:6px;padding:12px;font-size:18px;border-radius:8px;border:1px solid #3a4452;background:#10141a;color:#e8edf2}
 .dias-container{display:flex;gap:4px;margin-top:6px;margin-bottom:12px}
 .dias-container label{flex:1;background:#10141a;border:1px solid #3a4452;padding:8px 4px;text-align:center;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:0;color:#e8edf2}
 .dias-container input{display:none}
@@ -285,12 +387,16 @@ input[type="text"], input[type="time"]{display:block;width:100%;box-sizing:borde
   <label>Horário
     <input type="time" id="hora" required>
   </label>
-  
+
   <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
-    <input type="checkbox" id="repetir" checked style="width:20px;height:20px;" onchange="toggleDias(this.checked)"> Repetir alarme
+    <input type="checkbox" id="repetir" checked style="width:20px;height:20px;" onchange="toggleOpcoes(this.checked)"> Repetir alarme
   </label>
 
-  <div id="blocoDias">
+  <div id="blocoOpcoes">
+    <label>Repetir a cada quantas horas? (opcional)
+      <input type="number" id="intervalo" min="1" max="24" inputmode="numeric" placeholder="Deixe em branco para usar dias da semana">
+    </label>
+
     <label>Dias da semana (vazio = todos os dias)</label>
     <div class="dias-container">
       <label><input type="checkbox" name="dia" value="0"><span>Seg</span></label>
@@ -313,8 +419,8 @@ input[type="text"], input[type="time"]{display:block;width:100%;box-sizing:borde
 let editando = -1;
 const p = n => String(n).padStart(2, '0');
 
-function toggleDias(ativo) {
-  document.getElementById('blocoDias').style.display = ativo ? 'block' : 'none';
+function toggleOpcoes(ativo) {
+  document.getElementById('blocoOpcoes').style.display = ativo ? 'block' : 'none';
 }
 
 function btn(texto, classe, fn) {
@@ -337,17 +443,19 @@ function render(lista) {
   lista.forEach(a => {
     const card = document.createElement('div');
     card.className = 'card';
-    
+
     let infoStr = '';
     if (!a.repetir) {
       infoStr = 'Toca apenas uma vez<br>Próximo: ' + a.proximo;
+    } else if (a.intervalo > 0) {
+      infoStr = 'A cada ' + a.intervalo + ' h<br>Próximo: ' + a.proximo;
     } else {
       const nomesDias = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'];
       let dSel = [];
       for(let i=0; i<7; i++) {
         if(a.dias & (1 << i)) dSel.push(nomesDias[i]);
       }
-      let txtDias = dSel.length === 0 || dSel.length === 7 ? 'Todos os dias' : dSel.join(', ');
+      let txtDias = dSel.length === 0 || dSel.length === 7 ? 'Todo dia' : dSel.join(', ');
       infoStr = txtDias + '<br>Próximo: ' + a.proximo;
     }
 
@@ -380,8 +488,9 @@ function editar(a) {
   document.getElementById('nome').value = a.nome || '';
   document.getElementById('hora').value = p(a.hora) + ':' + p(a.minuto);
   document.getElementById('repetir').checked = a.repetir;
-  toggleDias(a.repetir);
-  
+  document.getElementById('intervalo').value = a.intervalo > 0 ? a.intervalo : '';
+  toggleOpcoes(a.repetir);
+
   const checkboxes = document.querySelectorAll('input[name="dia"]');
   checkboxes.forEach((cb, i) => {
     cb.checked = (a.dias & (1 << i)) !== 0;
@@ -396,7 +505,7 @@ function editar(a) {
 function cancelarEdicao() {
   editando = -1;
   document.getElementById('form').reset();
-  toggleDias(true);
+  toggleOpcoes(true);
   document.getElementById('tituloForm').textContent = 'Novo alarme';
   document.getElementById('btnSalvar').textContent = 'Adicionar';
   document.getElementById('btnCancelar').hidden = true;
@@ -420,7 +529,8 @@ document.getElementById('form').addEventListener('submit', async e => {
   e.preventDefault();
   const partes = document.getElementById('hora').value.split(':');
   const repetir = document.getElementById('repetir').checked ? 1 : 0;
-  
+  const intervalo = document.getElementById('intervalo').value || '0';
+
   let diasBitmask = 0;
   const checkboxes = document.querySelectorAll('input[name="dia"]:checked');
   checkboxes.forEach(cb => {
@@ -429,11 +539,12 @@ document.getElementById('form').addEventListener('submit', async e => {
 
   const nome = document.getElementById('nome').value.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   const corpo = new URLSearchParams({
-    id: editando, 
-    hora: partes[0], 
-    minuto: partes[1], 
-    repetir: repetir, 
-    dias: diasBitmask, 
+    id: editando,
+    hora: partes[0],
+    minuto: partes[1],
+    repetir: repetir,
+    intervalo: intervalo,
+    dias: diasBitmask,
     nome: nome
   });
 
@@ -454,10 +565,12 @@ setInterval(carregar, 30000);
 </html>
 )rawliteral";
 
+// Entrega a pagina ao celular
 void siteInicio() {
   server.send(200, "text/html; charset=utf-8", PAGINA);
 }
 
+// Entrega a lista de alarmes (a pagina usa isto para desenhar os cartoes)
 void siteListar() {
   uint32_t agora = (uint32_t)time(nullptr);
   String resposta = "[";
@@ -466,13 +579,13 @@ void siteListar() {
     if (!alarmes[i].usado) continue;
     if (!primeiro) resposta += ",";
     primeiro = false;
-    uint32_t disp = proximoDisparo(alarmes[i], agora);
-    String proximo = horaValida() ? textoProximo(disp) : String("--");
-    
+    String proximo = horaValida() ? textoProximo(proximoDisparo(alarmes[i], agora)) : String("--");
+
     resposta += "{\"id\":" + String(i) +
                 ",\"hora\":" + String(alarmes[i].hora) +
                 ",\"minuto\":" + String(alarmes[i].minuto) +
                 ",\"repetir\":" + String(alarmes[i].repetir) +
+                ",\"intervalo\":" + String(alarmes[i].intervalo) +
                 ",\"dias\":" + String(alarmes[i].diasSemana) +
                 ",\"nome\":\"" + String(alarmes[i].nome) + "\"" +
                 ",\"proximo\":\"" + proximo + "\"}";
@@ -481,6 +594,7 @@ void siteListar() {
   server.send(200, "application/json", resposta);
 }
 
+// Cria um alarme novo (id = -1) ou edita um existente
 void siteSalvar() {
   if (!server.hasArg("hora") || !server.hasArg("minuto")) {
     server.send(400, "text/plain", "Dados incompletos.");
@@ -490,11 +604,12 @@ void siteSalvar() {
   int hora = server.arg("hora").toInt();
   int minuto = server.arg("minuto").toInt();
   int repetir = server.hasArg("repetir") ? server.arg("repetir").toInt() : 1;
+  int intervalo = server.hasArg("intervalo") ? server.arg("intervalo").toInt() : 0;
   uint8_t dias = server.hasArg("dias") ? server.arg("dias").toInt() : 0;
   String nome = server.hasArg("nome") ? server.arg("nome") : String("");
 
-  if (hora < 0 || hora > 23 || minuto < 0 || minuto > 59) {
-    server.send(400, "text/plain", "Horário inválido.");
+  if (hora < 0 || hora > 23 || minuto < 0 || minuto > 59 || intervalo < 0 || intervalo > 24) {
+    server.send(400, "text/plain", "Valores inválidos.");
     return;
   }
   if (!horaValida()) {
@@ -502,7 +617,7 @@ void siteSalvar() {
     return;
   }
 
-  if (id < 0) {   
+  if (id < 0) {   // alarme novo: procura uma posicao livre na lista
     for (int i = 0; i < MAX_ALARMES; i++) {
       if (!alarmes[i].usado) { id = i; break; }
     }
@@ -519,10 +634,11 @@ void siteSalvar() {
   alarmes[id].hora = hora;
   alarmes[id].minuto = minuto;
   alarmes[id].repetir = repetir;
+  alarmes[id].intervalo = intervalo;
   alarmes[id].diasSemana = dias;
   copiarNome(alarmes[id].nome, nome);
-  
-  // Define o timestamp base (ancora)
+
+  // Primeira vez que o alarme toca
   time_t agora = time(nullptr);
   struct tm t;
   localtime_r(&agora, &t);
@@ -531,13 +647,16 @@ void siteSalvar() {
   t.tm_sec = 0;
   t.tm_isdst = -1;
   time_t alvo = mktime(&t);
-  if (alvo <= agora && !repetir) alvo += 86400; // se ja passou hoje e e unico, joga para amanha para calcular direito
+  if (alvo <= agora && (intervalo > 0 || !repetir)) {
+    alvo += (intervalo > 0 ? intervalo * 3600UL : 86400UL);
+  }
   alarmes[id].ancora = (uint32_t)alvo;
 
   salvarAlarmes();
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Apaga um alarme
 void siteExcluir() {
   int id = server.hasArg("id") ? server.arg("id").toInt() : -1;
   if (id < 0 || id >= MAX_ALARMES || !alarmes[id].usado) {
@@ -549,16 +668,17 @@ void siteExcluir() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// ================== 9. SETUP ==================
+// ================== 9. SETUP (roda uma vez ao ligar) ==================
 
 void setup() {
   pinMode(BUZZER1, OUTPUT);
   pinMode(BUZZER2, OUTPUT);
   pinMode(BUZZER3, OUTPUT);
   pinMode(TAMPA, INPUT_PULLUP);
+  pinMode(BOTAO, INPUT_PULLUP);
   pinMode(TFT_LED, OUTPUT);
-  digitalWrite(TFT_LED, HIGH);
-  pinMode(BOTAO_WIFI, INPUT_PULLUP);
+  digitalWrite(TFT_LED, HIGH);   // comeca ligado para mostrar o andamento
+  displayLigado = true;
 
   SPI.begin(TFT_SCK, -1, TFT_SDA, TFT_CS);
   tft.initR(INITR_BLACKTAB);
@@ -567,33 +687,28 @@ void setup() {
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
   tft.setCursor(5, 5);
+  tft.print("Conectando no Wi-Fi...");
 
   memoria.begin("alarmes", false);
   carregarAlarmes();
 
+  // Conecta no Wi-Fi. Se nao houver rede salva, cria a rede "AlarmeRemedio" para configurar.
   WiFiManager wm;
-  if (digitalRead(BOTAO_WIFI) == LOW) {
-    tft.print("Resetando Wi-Fi...");
-    delay(1000);
-    wm.resetSettings();
-  }
-
   wm.setAPCallback(telaConfigurarWifi);
   wm.setConnectTimeout(20);
   wm.setConfigPortalTimeout(300);
-
-  tft.setCursor(5, 5);
-  tft.print("Conectando no Wi-Fi...");
-
   if (!wm.autoConnect("AlarmeRemedio")) {
     ESP.restart();
   }
+  WiFi.setSleep(false);   // desliga a economia de energia do Wi-Fi: o site responde melhor
 
+  // Pega a hora na internet (fuso de Brasilia/Fortaleza: UTC-3)
   configTzTime("<-03>3", "pool.ntp.org", "time.google.com");
   struct tm agora;
   unsigned long inicio = millis();
   while (!getLocalTime(&agora, 500) && millis() - inicio < 15000) {}
 
+  // Liga o site
   MDNS.begin("alarme");
   server.on("/", HTTP_GET, siteInicio);
   server.on("/api/alarmes", HTTP_GET, siteListar);
@@ -601,53 +716,44 @@ void setup() {
   server.on("/api/excluir", HTTP_POST, siteExcluir);
   server.begin();
 
+  luzAcesaAte = millis() + LUZ_APOS_LIGAR_MS;   // luz acesa por 2 minutos para voce ver o endereco
   telaRelogio();
 }
 
-// ================== 10. LOOP ==================
+// ================== 10. LOOP (repete para sempre) ==================
 
 void loop() {
-  if (digitalRead(BOTAO_WIFI) == LOW) {
-    unsigned long tempoInicioPress = millis();
-    while (digitalRead(BOTAO_WIFI) == LOW) {
-      if (millis() - tempoInicioPress > 3000) {
-        tft.fillScreen(ST77XX_BLACK);
-        tft.setCursor(5, 50);
-        tft.setTextSize(1);
-        tft.setTextColor(ST77XX_YELLOW);
-        tft.print("Resetando Wi-Fi...");
-        
-        WiFiManager wm;
-        wm.resetSettings();
-        delay(1000);
-        ESP.restart();
-      }
-      delay(100);
-    }
-  }
-
+  verificarBotao();
   server.handleClient();
   if (!horaValida()) return;
 
   uint32_t agora = (uint32_t)time(nullptr);
+  controlarLuzDisplay(agora);
+
   if (ultimaChecagem == 0) ultimaChecagem = agora;
 
   if (!tocando) {
+    // --- Modo normal: mostra a hora e confere se algum alarme disparou ---
     mostrarHora();
 
     if (agora != ultimaChecagem) {
       for (int i = 0; i < MAX_ALARMES; i++) {
         if (!alarmes[i].usado) continue;
-        
+
         uint32_t disp = proximoDisparo(alarmes[i], ultimaChecagem + 1);
         if (disp != 0xFFFFFFFFUL && disp <= agora) {
           tocando = true;
           tampaJaFechou = !tampaAberta();
+          ultimoEventoAlarme = agora;
+
+          // Acende a tela na hora do alarme
+          digitalWrite(TFT_LED, HIGH);
+          displayLigado = true;
+
           telaAlarme(alarmes[i].nome);
           dicaTampa(!tampaJaFechou);
 
-          // Se for um alarme que toca apenas uma vez, desativa/exclui ele da memoria para nao tocar de novo
-          if (!alarmes[i].repetir) {
+          if (!alarmes[i].repetir) {   // alarme de uma vez so: apaga da lista
             memset(&alarmes[i], 0, sizeof(Alarme));
             salvarAlarmes();
           }
@@ -659,6 +765,8 @@ void loop() {
     delay(50);
 
   } else {
+    // --- Alarme tocando: apita ate a tampa ser aberta ---
+    // (se a tampa ja estava aberta, ela precisa fechar e abrir de novo)
     bipe(300);
     delay(200);
     server.handleClient();
@@ -670,6 +778,7 @@ void loop() {
       }
     } else if (tampaJaFechou) {
       tocando = false;
+      ultimoEventoAlarme = (uint32_t)time(nullptr);
       telaRelogio();
     }
   }
