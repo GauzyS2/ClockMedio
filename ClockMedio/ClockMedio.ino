@@ -1,22 +1,9 @@
-/*
- * ALARME DE REMEDIO
- * ESP32-S3 + display 1.77" (ST7735) + 3 buzzers + fim de curso
- *
- * Este projeto tem DOIS arquivos (duas abas na Arduino IDE):
- *   ClockMedio.ino  -> este arquivo, com a logica
- *   pagina.h            -> o site (HTML)
- *
- * O que faz:
- *  1. Conecta no Wi-Fi. Na primeira vez cria a rede "AlarmeRemedio" para voce
- *     informar o Wi-Fi da sua casa pelo celular.
- *  2. Pega a hora certa na internet e mostra no display, com o endereco do site.
- *  3. No site (celular) voce cria, edita e exclui alarmes de dois tipos:
- *       - Padrao: toca todo dia no mesmo horario, ou a cada X horas.
- *       - Dias da semana: toca num horario fixo, so nos dias escolhidos.
- *  4. Na hora do alarme, os buzzers tocam ate a tampa ser aberta.
- *
- * Bibliotecas: Adafruit GFX Library, Adafruit ST7735 and ST7789 Library, WiFiManager (tzapu)
- */
+/*====================================================
+Bibliotecas a instalar:
+- Adafruit GFX Library;
+- Adafruit ST7735 and ST7789 Library;
+- WiFiManager (by tzapu).
+====================================================*/
 
 #include <WiFi.h>
 #include <WiFiManager.h>
@@ -29,55 +16,60 @@
 #include <Adafruit_ST7735.h>
 #include "pagina.h"
 
-// ================== 1. CONFIGURACOES ==================
+/*====================================================
+                  1. CONF DOS ALARMES
+====================================================*/
 
-#define MAX_ALARMES 10   // quantos alarmes cabem
+#define MAX_ALARMES 10 // Quantos alarmes podem ser criados.
+#define PADRAO       0 // Recorrente por intervalo de horas ou mesma hora todo dia
+#define DIAS         1 // Mesma hora em determinados dias da semana
 
-#define TIPO_PADRAO 0    // todo dia, ou a cada X horas
-#define TIPO_DIAS   1    // so nos dias da semana escolhidos
+/*====================================================
+                      2. PINAGEM
+====================================================*/
 
-// ================== 2. PINOS ==================
+//Display
+#define TFT_SCK 12
+#define TFT_SDA 11
+#define TFT_CS  10
+#define TFT_RS   9
+#define TFT_RST  8
+#define TFT_LED  7
 
-// Display
-#define TFT_SCK  12
-#define TFT_SDA  11
-#define TFT_CS   10
-#define TFT_RS    9
-#define TFT_RST   8
-#define TFT_LED   7
-
-// Buzzers e fim de curso
+//Buzzers e fim de curso
 #define BUZZER1 38
 #define BUZZER2 39
 #define BUZZER3 40
-#define TAMPA   21
 
-// Botao BOOT da placa: segurar 3 segundos apaga o Wi-Fi salvo
-#define BOTAO 0
+//Botões e sensor de fim de curso
+#define BOTAO  0 // Interligado ao BOOT, pressionar reinicia a configuração de Wi-Fi.
+#define TAMPA 21 // Sensor para detectar estado da tampa.
 
-// ================== 3. VARIAVEIS ==================
+/*====================================================
+                      3. VARIÁVEIS
+====================================================*/
 
 Adafruit_ST7735 tft = Adafruit_ST7735(&SPI, TFT_CS, TFT_RS, TFT_RST);
 WebServer server(80);
 Preferences memoria;
 
-// Cada alarme guarda estas informacoes
+//Parâmetros dos alarmes
 struct Alarme {
-  uint8_t usado;      // 1 = esta posicao da lista tem um alarme
-  uint8_t tipo;       // TIPO_PADRAO ou TIPO_DIAS
-  uint8_t hora;       // 0 a 23
-  uint8_t minuto;     // 0 a 59
-  uint8_t intervalo;  // tipo padrao: de quantas em quantas horas (24 = so uma vez por dia)
-  char dias[8];       // tipo dias: 7 letras '0' ou '1' (Seg Ter Qua Qui Sex Sab Dom). Ex.: "1010100"
-  char nome[33];      // nome do remedio
+  uint8_t usado;     // 1 = Posição ocupada
+  uint8_t tipo;      // PADRAO ou DIAS
+  uint8_t hora;      // 0 a 23
+  uint8_t minuto;    // 0 a 59
+  uint8_t intervalo; // Tipo padrão: intervalo de horas
+  char dias[8];      // Tipo dias: 7 letras '0' ou '1' (Seg Ter Qua Qui Sex Sab Dom)
+  char nome[33];     // Nome do remédio
 };
 
-Alarme alarmes[MAX_ALARMES];   // a lista de alarmes
+Alarme alarmes[MAX_ALARMES]; // Lista dos alarmes
 
-bool tocando = false;          // true enquanto o alarme esta tocando
-bool tampaJaFechou = false;    // true quando a tampa foi vista fechada durante o alarme
-int ultimoMinuto = -1;         // ultimo minuto em que conferimos os alarmes
-int ultimoSegundo = -1;        // para so redesenhar a hora quando o segundo muda
+bool tocando = false;        // Verdadeiro enquanto o alarme está tocando.
+bool tampaJaFechou = false;  // Verdadeiro quando a tampa é fechada durante o alarme.
+int ultimoMinuto = -1;       // Último minuto em que conferiu os alarmes.
+int ultimoSegundo = -1;      // Para só redesenhar a hora quando o segundo muda.
 
 // ================== 4. FUNCOES: ALARMES NA MEMORIA ==================
 
@@ -119,7 +111,7 @@ bool alarmeEstaNaHora(const Alarme& a, int minutoDoDia, int diaSemana) {
   int minutoDoAlarme = a.hora * 60 + a.minuto;
 
   // Tipo dias da semana: toca no horario do alarme, so nos dias marcados
-  if (a.tipo == TIPO_DIAS) {
+  if (a.tipo == DIAS) {
     return a.dias[diaSemana] == '1' && minutoDoDia == minutoDoAlarme;
   }
 
@@ -181,21 +173,21 @@ void telaConfigurarWifi(WiFiManager* wm) {
   tft.print("CONFIGURAR WI-FI");
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(5, 25);
-  tft.print("1) No celular, conecte");
+  tft.print("1) Em outro aparelho,");
   tft.setCursor(5, 36);
-  tft.print("na rede:");
+  tft.print("acesse o wifi:");
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_CYAN);
   tft.setCursor(5, 50);
-  tft.print("AlarmeRemedio");
+  tft.print("ClockMedio");
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(5, 80);
-  tft.print("2) Abra no navegador:");
+  tft.print("2) Acesse no navegador:");
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_GREEN);
   tft.setCursor(5, 95);
-  tft.print("192.168.4.1");
+  tft.print("conectar.com");
 }
 
 // Escreve a hora no display, no formato HH:MM:SS (so quando o segundo muda)
@@ -300,13 +292,13 @@ void siteSalvar() {
     server.send(400, "text/plain", "Horário inválido.");
     return;
   }
-  if (tipo == TIPO_PADRAO) {
+  if (tipo == PADRAO) {
     // O intervalo precisa dividir 24 horas certinho: 1, 2, 3, 4, 6, 8, 12 ou 24
     if (intervalo < 1 || intervalo > 24 || 24 % intervalo != 0) {
       server.send(400, "text/plain", "Intervalo inválido.");
       return;
     }
-  } else if (tipo == TIPO_DIAS) {
+  } else if (tipo == DIAS) {
     if (dias.length() != 7 || dias.indexOf('1') < 0) {
       server.send(400, "text/plain", "Escolha pelo menos um dia da semana.");
       return;
@@ -338,7 +330,7 @@ void siteSalvar() {
   alarmes[id].minuto = minuto;
   alarmes[id].intervalo = intervalo;
   for (int i = 0; i < 7; i++) {
-    alarmes[id].dias[i] = (tipo == TIPO_DIAS && dias[i] == '1') ? '1' : '0';
+    alarmes[id].dias[i] = (tipo == DIAS && dias[i] == '1') ? '1' : '0';
   }
   alarmes[id].dias[7] = '\0';
   copiarNome(alarmes[id].nome, nome);
@@ -385,12 +377,12 @@ void setup() {
   memoria.begin("alarmes", false);
   carregarAlarmes();
 
-  // Conecta no Wi-Fi. Se nao houver rede salva, cria a rede "AlarmeRemedio" para configurar.
+  // Conecta no Wi-Fi. Se nao houver rede salva, cria a rede "ClockMédio" para configurar.
   WiFiManager wm;
   wm.setAPCallback(telaConfigurarWifi);
   wm.setConnectTimeout(20);          // segundos tentando a rede salva
   wm.setConfigPortalTimeout(300);    // segundos esperando a configuracao pelo celular
-  if (!wm.autoConnect("AlarmeRemedio")) {
+  if (!wm.autoConnect("ClockMédio")) {
     ESP.restart();                   // nao conseguiu: reinicia e tenta de novo
   }
   WiFi.setSleep(false);              // desliga a economia de energia do Wi-Fi: o site responde melhor
@@ -404,7 +396,7 @@ void setup() {
   }
 
   // Liga o site
-  MDNS.begin("alarme");              // tambem abre em http://alarme.local
+  MDNS.begin("clockmedio");              // tambem abre em http://clockmedio.local
   server.on("/", HTTP_GET, siteInicio);
   server.on("/api/alarmes", HTTP_GET, siteListar);
   server.on("/api/salvar", HTTP_POST, siteSalvar);
