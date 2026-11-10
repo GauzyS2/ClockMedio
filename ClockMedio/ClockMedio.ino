@@ -3,7 +3,7 @@
  * ESP32-S3 + display 1.77" (ST7735) + 3 buzzers + fim de curso
  *
  * Este projeto tem DOIS arquivos (duas abas na Arduino IDE):
- *   alarme_remedio.ino  -> este arquivo, com a logica
+ *   ClockMedio.ino  -> este arquivo, com a logica
  *   pagina.h            -> o site (HTML)
  *
  * O que faz:
